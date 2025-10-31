@@ -1,6 +1,6 @@
 
-from flask import Flask, request, send_file, abort
-from flask_cors import CORS
+from flask import Flask, request, send_file, abort, make_response
+from flask_cors import CORS, cross_origin
 from io import BytesIO
 from datetime import datetime, date
 from reportlab.lib.pagesizes import A4
@@ -12,19 +12,25 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 app = Flask(__name__)
-# Adjust origins to your IONOS domain for tighter security, e.g. {"origins": ["https://deinedomain.de"]}
-CORS(app, resources={r"/generate-pdf": {"origins": "*"}})
+
+# Allow your production domains (add both with/without www)
+ALLOWED_ORIGINS = ["https://finkfuture.com", "https://www.finkfuture.com", "http://localhost:5500", "http://127.0.0.1:5500"]
+
+CORS(app,
+     resources={r"/generate-pdf": {"origins": ALLOWED_ORIGINS}},
+     supports_credentials=False,
+     methods=["POST", "OPTIONS"],
+     allow_headers=["Content-Type"],
+     max_age=600)
 
 def calc_plan(initial_capital: float, daily_rate: float, months: int, start_date: date):
-    def days_in_month(y,m):
-        import calendar
-        return calendar.monthrange(y,m)[1]
+    import calendar
     months_out = []
     capital = initial_capital
     y = start_date.year
-    m = start_date.month
+    m = start_date.month  # 1..12
     for mi in range(months):
-        dim = days_in_month(y, m)
+        dim = calendar.monthrange(y, m)[1]
         first_day = start_date.day if mi == 0 else 1
         gross_sum = fee_sum = reinvest_sum = 0.0
         month_start_cap = capital
@@ -38,7 +44,7 @@ def calc_plan(initial_capital: float, daily_rate: float, months: int, start_date
             gross_sum += gross; fee_sum += fee; reinvest_sum += reinvest
             capital = end_cap
         months_out.append({
-            "label": datetime(y,m,1).strftime("%B %Y"),
+            "label": date(y,m,1).strftime("%B %Y"),
             "rows": rows,
             "totals": { "start": month_start_cap, "end": capital, "gross": gross_sum, "fee": fee_sum, "reinvest": reinvest_sum }
         })
@@ -88,11 +94,10 @@ def build_pdf(trader_name, capital, daily_rate, months, start_date):
 
     story = []
 
-    # Cover with top turquoise bar
     from reportlab.lib.colors import HexColor
     from reportlab.platypus import Flowable
     class TopBar(Flowable):
-        def __init__(self, h=30): self.h = h
+        def __init__(self, h=36): self.h = h
         def draw(self):
             self.canv.setFillColor(HexColor("#00d8d8"))
             w = self.canv._pagesize[0]
@@ -108,7 +113,6 @@ def build_pdf(trader_name, capital, daily_rate, months, start_date):
     story.append(Paragraph("© 2025 Tim Finkbeiner – Alle Rechte vorbehalten", styles["Footer"]))
     story.append(PageBreak())
 
-    # TOC
     story.append(Paragraph("Inhaltsverzeichnis", styles["H1"]))
     toc = TableOfContents()
     toc.levelStyles = [
@@ -118,7 +122,6 @@ def build_pdf(trader_name, capital, daily_rate, months, start_date):
     story.append(toc)
     story.append(PageBreak())
 
-    # Overview
     story.append(Paragraph("Überblick", styles["H1"]))
     story.append(Paragraph(
         "Dieser Businessplan beschreibt die Zinseszinsstrategie eines Copy Traders. "
@@ -126,7 +129,6 @@ def build_pdf(trader_name, capital, daily_rate, months, start_date):
         "Damit wächst das Kapital kontinuierlich – professionell, seriös und sauber dokumentiert.", styles["Body"]
     ))
 
-    # Inputs
     story.append(Paragraph("Finanzielle Ausgangsdaten", styles["H1"]))
     eur = lambda x: f"{x:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
     data = [
@@ -146,7 +148,6 @@ def build_pdf(trader_name, capital, daily_rate, months, start_date):
     ]))
     story.append(t)
 
-    # Calculation
     months_out, overall = calc_plan(capital, daily_rate, months, start_date)
     story.append(Paragraph("Kennzahlen & Ergebnisübersicht", styles["H1"]))
     kpi = Table([
@@ -169,7 +170,6 @@ def build_pdf(trader_name, capital, daily_rate, months, start_date):
         "Somit entspricht das Wachstum pro Tag 90% des Bruttogewinns auf das jeweils aktuelle Kapital.", styles["Info"]
     ))
 
-    # Month tables
     for mi, mo in enumerate(months_out, start=1):
         story.append(Paragraph(f"Monat {mi}: {mo['label']}", styles["H2"]))
         header = ["Tag", "Startkapital", "Gewinn (brutto)", "Fee 10%", "Reinvest 90%", "Endkapital"]
@@ -188,7 +188,6 @@ def build_pdf(trader_name, capital, daily_rate, months, start_date):
         story.append(table)
         story.append(Spacer(1, 0.4*cm))
 
-    # Explanation text
     story.append(Paragraph("Zinseszins – Erklärung", styles["H1"]))
     expl = [
         "💸 <b>Der tägliche Zinseszins – Dein geheimer Wachstumsbooster im Daytrading</b><br/><br/>"
@@ -230,7 +229,15 @@ def build_pdf(trader_name, capital, daily_rate, months, start_date):
     buf.seek(0)
     return buf
 
+# Explicit OPTIONS route for preflight (some hosts are picky)
+@app.route("/generate-pdf", methods=["OPTIONS"])
+@cross_origin(origins=ALLOWED_ORIGINS, methods=["POST","OPTIONS"], headers=["Content-Type"])
+def options_pdf():
+    resp = make_response("", 204)
+    return resp
+
 @app.post("/generate-pdf")
+@cross_origin(origins=ALLOWED_ORIGINS, methods=["POST"], headers=["Content-Type"])
 def generate_pdf():
     try:
         data = request.get_json(force=True)
@@ -249,3 +256,5 @@ def generate_pdf():
     pdf = build_pdf(trader_name, capital, daily_rate, months, start_date)
     filename = f"Businessplan_{trader_name.replace(' ','_')}.pdf"
     return send_file(pdf, mimetype="application/pdf", as_attachment=True, download_name=filename)
+
+# Gunicorn entry point: app
